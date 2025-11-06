@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, redirect, url_for, session, abort, jsonify, send_from_directory, Response
 import os
-import psycopg2 # Para PostgreSQL
+import psycopg2 # ¡Para PostgreSQL!
 from psycopg2.extras import RealDictCursor
 import pandas as pd
 from datetime import datetime, timedelta
@@ -16,17 +16,14 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'una_clave_secreta_local_muy_fuerte') 
 
 # --- Configuración de Subida de Archivos (Para Render Disk) ---
-# Render nos dará una variable 'RENDER_DISK_PATH' que apunta a '/var/data/uploads'
-# Si esa variable no existe (porque estamos en local), usará una carpeta 'uploads' normal.
-UPLOAD_FOLDER_NAME = 'uploads'
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+UPLOAD_FOLDER_NAME = 'uploads'
 # Usamos la ruta del disco de Render si está disponible
 UPLOAD_FOLDER_PATH = os.environ.get('RENDER_DISK_PATH', os.path.join(BASE_DIR, UPLOAD_FOLDER_NAME))
 
 ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'} 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER_PATH 
 
-# Asegurarse de que las carpetas de subida existan
 if not os.path.exists(UPLOAD_FOLDER_PATH):
     os.makedirs(UPLOAD_FOLDER_PATH)
 # --- Fin de la Configuración de Subida ---
@@ -70,6 +67,18 @@ def get_db_connection():
 
 # Esta función la ejecutaremos manualmente en Render
 def init_db():
+    # NOTA: Esta función es solo para crear las tablas.
+    # En producción (Render), la ejecutaremos desde la consola (Shell).
+    # Para pruebas locales, necesitarías crear una DB PostgreSQL local.
+    
+    # Si detecta que estamos en local (DEBUG=True) y no hay DB_URL,
+    # podría usar SQLite, pero lo mantendremos simple y enfocado a Render.
+    
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+    if not DATABASE_URL:
+        print("No se encontró DATABASE_URL. Saltando init_db().")
+        return
+        
     conn = get_db_connection()
     with conn.cursor() as cursor:
         # Tabla 1: Clientes
@@ -588,8 +597,8 @@ def get_mutua_details(poliza_id):
         if original_fecha_inicio:
             try:
                 fecha_inicio_dt = original_fecha_inicio
-                details['fecha_inicio_formateada'] = fecha_inicio_dt.strftime('%d/%m/%Y') # Formatear para mostrar
-                details['fecha_inicio_original'] = original_fecha_inicio.strftime('%Y-%m-%d') # Para el <input type="date">
+                details['fecha_inicio_formateada'] = fecha_inicio_dt.strftime('%d/%m/%Y') 
+                details['fecha_inicio_original'] = original_fecha_inicio.strftime('%Y-%m-%d')
                 
                 if details['tipo_pago'] == 'Pactada':
                     cursor.execute("""
@@ -694,7 +703,7 @@ def pagar_recibo(recibo_id):
     return redirect(url_for('dashboard'))
 
 
-# --- RUTAS DE GESTIÓN DE DOCUMENTOS (MODIFICADAS PARA AZURE BLOB) ---
+# --- RUTAS DE GESTIÓN DE DOCUMENTOS (MODIFICADAS PARA RENDER DISK) ---
 
 def allowed_file(filename):
     return '.' in filename and \
@@ -710,17 +719,14 @@ def upload_documento(poliza_tabla, poliza_id):
     if file.filename == '':
         return redirect(url_for('dashboard'))
 
-    if file and allowed_file(file.filename) and blob_service_client:
+    if file and allowed_file(file.filename):
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         filename_base = secure_filename(file.filename)
         filename_seguro = f"{timestamp}_{poliza_tabla}_{poliza_id}_{filename_base}"
         
-        content_type = file.content_type
-        
         try:
-            blob_client = blob_service_client.get_blob_client(container=AZURE_CONTAINER_NAME, blob=filename_seguro)
-            content_settings = ContentSettings(content_type=content_type)
-            blob_client.upload_blob(file.stream, content_settings=content_settings)
+            # Guardar el archivo en el disco (en local o en el disco de Render)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename_seguro))
             
             conn = get_db_connection()
             with conn.cursor() as cursor:
@@ -732,7 +738,7 @@ def upload_documento(poliza_tabla, poliza_id):
             conn.close()
         
         except Exception as e:
-            print(f"Error al subir a Azure Blob: {e}")
+            print(f"Error al subir archivo: {e}")
 
     return redirect(url_for('dashboard'))
 
@@ -760,18 +766,17 @@ def download_documento(doc_id):
         documento = cursor.fetchone()
     conn.close()
     
-    if documento and blob_service_client:
+    if documento:
         try:
-            blob_client = blob_service_client.get_blob_client(container=AZURE_CONTAINER_NAME, blob=documento['path_archivo'])
-            stream = blob_client.download_blob().readall()
-            
-            return Response(
-                stream,
-                mimetype=blob_client.get_blob_properties().content_settings.content_type,
-                headers={"Content-Disposition": f"attachment;filename=\"{documento['nombre_visible']}\""}
+            # Servir el archivo desde el disco (local o Render)
+            return send_from_directory(
+                app.config['UPLOAD_FOLDER'], 
+                documento['path_archivo'], 
+                as_attachment=True, 
+                download_name=documento['nombre_visible']
             )
         except Exception as e:
-            print(f"Error al descargar de Azure Blob: {e}")
+            print(f"Error al descargar archivo: {e}")
             abort(404)
     
     abort(404)
@@ -784,13 +789,14 @@ def delete_documento(doc_id):
         cursor.execute('SELECT * FROM documentos WHERE id = %s', (doc_id,))
         documento = cursor.fetchone()
         
-        if documento and blob_service_client:
+        if documento:
             try:
-                blob_client = blob_service_client.get_blob_client(container=AZURE_CONTAINER_NAME, blob=documento['path_archivo'])
-                blob_client.delete_blob()
-            except Exception as e:
-                print(f"Error borrando blob: {e}")
+                # 1. Borrar el archivo del disco
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], documento['path_archivo']))
+            except OSError as e:
+                print(f"Error borrando archivo: {e.strerror}")
             
+            # 2. Borrar el registro de la DB
             cursor.execute('DELETE FROM documentos WHERE id = %s', (doc_id,))
             conn.commit()
         
@@ -815,7 +821,7 @@ def add_tarea():
         cursor.execute("""
             INSERT INTO tareas (cliente_id, descripcion, fecha_limite, estado) 
             VALUES (%s, %s, %s, 'Pendiente')
-        """, (cliente_id if cliente_id else None, descripcion, fecha_limite))
+        """, (cliente_id if (cliente_id and cliente_id.isdigit()) else None, descripcion, fecha_limite))
     conn.commit()
     conn.close()
     
