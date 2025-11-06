@@ -63,8 +63,14 @@ Los siguientes archivos **NO** están versionados en Git por razones de segurida
 Para mejorar aún más la seguridad de la aplicación:
 
 1. **Mover credenciales hardcodeadas a variables de entorno:**
-   - `USUARIO_ADMIN` y `PASSWORD_ADMIN` deben estar en `.env`
-   - Usar hash para las contraseñas (ej: bcrypt)
+   - Actualmente `USUARIO_ADMIN` y `PASSWORD_ADMIN` están hardcodeados en `app.py` (líneas 32-33)
+   - Estas credenciales deben moverse a `.env` para evitar exposición en el código fuente
+   - Usar hash para las contraseñas (ej: bcrypt o werkzeug.security)
+   - Ejemplo en `.env`:
+     ```
+     ADMIN_USERNAME="tu_usuario"
+     ADMIN_PASSWORD_HASH="tu_hash_bcrypt"
+     ```
 
 2. **Implementar autenticación más robusta:**
    - Usar Flask-Login o Flask-Security
@@ -103,7 +109,7 @@ Este proyecto está configurado para desplegarse en Render:
 
 Al contribuir a este proyecto:
 
-1. **NUNCA** commits archivos `.env` o bases de datos
+1. **NUNCA** hagas commit de archivos `.env` o bases de datos
 2. Actualiza `.env.example` si añades nuevas variables de entorno
 3. Documenta cualquier cambio de seguridad en este README
 
