@@ -1,36 +1,35 @@
 from flask import Flask, render_template, request, redirect, url_for, session, abort, jsonify, send_from_directory, Response
 import os
-import psycopg2 # ¡NUEVO! Reemplaza a sqlite3
-from psycopg2.extras import RealDictCursor # Para obtener resultados como diccionarios
+import psycopg2 # Para PostgreSQL
+from psycopg2.extras import RealDictCursor
 import pandas as pd
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from werkzeug.utils import secure_filename 
-from azure.storage.blob import BlobServiceClient, ContentSettings # ¡NUEVO! Para subir archivos
-from dotenv import load_dotenv # ¡NUEVO! Para cargar contraseñas
+from dotenv import load_dotenv
 
 # --- Cargar Variables de Entorno ---
-load_dotenv() # Carga las variables del archivo .env
+load_dotenv() 
 
 # --- Configuración de la Aplicación ---
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'una_clave_secreta_local_muy_fuerte') 
 
-# --- Configuración de Azure Blob Storage (Documentos) ---
-AZURE_CONNECTION_STRING = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
-AZURE_CONTAINER_NAME = os.environ.get('AZURE_STORAGE_CONTAINER_NAME')
+# --- Configuración de Subida de Archivos (Para Render Disk) ---
+# Render nos dará una variable 'RENDER_DISK_PATH' que apunta a '/var/data/uploads'
+# Si esa variable no existe (porque estamos en local), usará una carpeta 'uploads' normal.
+UPLOAD_FOLDER_NAME = 'uploads'
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+# Usamos la ruta del disco de Render si está disponible
+UPLOAD_FOLDER_PATH = os.environ.get('RENDER_DISK_PATH', os.path.join(BASE_DIR, UPLOAD_FOLDER_NAME))
 
-# Inicializar el cliente de Blob Storage
-blob_service_client = None
-if AZURE_CONNECTION_STRING:
-    try:
-        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
-    except ValueError:
-        print("Error: La cadena de conexión de Azure Storage no es válida.")
-else:
-    print("Advertencia: No se ha configurado la cadena de conexión de Azure Storage.")
+ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'} 
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER_PATH 
 
-ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'}
+# Asegurarse de que las carpetas de subida existan
+if not os.path.exists(UPLOAD_FOLDER_PATH):
+    os.makedirs(UPLOAD_FOLDER_PATH)
+# --- Fin de la Configuración de Subida ---
 
 # --- Configuración de Autenticación ---
 USUARIO_ADMIN = "72296378H"
@@ -41,7 +40,6 @@ NOMBRE_USUARIO = "MARLON MONTES"
 def find_or_create_cliente(cursor, nombre, apellido, dni):
     cliente_id = None
     if dni: 
-        # MODIFICADO: Sintaxis de %s para PostgreSQL
         cursor.execute("SELECT id FROM clientes WHERE dni = %s", (dni,))
         existing_client = cursor.fetchone()
         if existing_client:
@@ -60,28 +58,21 @@ def find_or_create_cliente(cursor, nombre, apellido, dni):
         
     return cliente_id
 
-# --- Configuración de la Base de Datos (MODIFICADA PARA POSTGRESQL) ---
+# --- Configuración de la Base de Datos (POSTGRESQL) ---
 
 def get_db_connection():
     DATABASE_URL = os.environ.get('DATABASE_URL')
     if not DATABASE_URL:
-        # Si estamos en local (debug=True), usamos SQLite como respaldo
-        if app.debug:
-            print("ADVERTENCIA: Usando base de datos SQLite local (polizas.db)")
-            conn = sqlite3.connect('polizas.db')
-            conn.row_factory = sqlite3.Row
-            return conn
         raise ValueError("No se ha configurado la variable de entorno DATABASE_URL")
     
-    # Conexión a PostgreSQL
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
+# Esta función la ejecutaremos manualmente en Render
 def init_db():
-    # Esta función ahora solo es para crear el schema, la ejecutaremos manualmente en Azure
     conn = get_db_connection()
     with conn.cursor() as cursor:
-        # Tabla 1: Clientes (Sintaxis PostgreSQL)
+        # Tabla 1: Clientes
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS clientes (
                 id SERIAL PRIMARY KEY,
@@ -91,7 +82,7 @@ def init_db():
             );
         """)
         
-        # Tabla 2: Pólizas Generales (Sintaxis PostgreSQL)
+        # Tabla 2: Pólizas Generales
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS polizas (
                 id SERIAL PRIMARY KEY,
@@ -106,7 +97,7 @@ def init_db():
             );
         """)
         
-        # Tabla 3: Pólizas Mutua (Sintaxis PostgreSQL)
+        # Tabla 3: Pólizas Mutua
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS polizas_mutua (
                 id SERIAL PRIMARY KEY,
@@ -117,7 +108,7 @@ def init_db():
             );
         """)
         
-        # Tabla 4: Recibos (Sintaxis PostgreSQL)
+        # Tabla 4: Recibos
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS recibos (
                 id SERIAL PRIMARY KEY,
@@ -131,19 +122,19 @@ def init_db():
             );
         """)
 
-        # Tabla 5: Documentos (Sintaxis PostgreSQL)
+        # Tabla 5: Documentos
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS documentos (
                 id SERIAL PRIMARY KEY,
                 poliza_id INTEGER NOT NULL,
                 poliza_tabla VARCHAR(50) NOT NULL, 
                 nombre_visible VARCHAR(255),     
-                path_archivo VARCHAR(255) NOT NULL, /* Ahora es el nombre del blob */
+                path_archivo VARCHAR(255) NOT NULL, 
                 fecha_subida DATE NOT NULL
             );
         """)
         
-        # Tabla 6: Tareas (Sintaxis PostgreSQL)
+        # Tabla 6: Tareas
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tareas (
                 id SERIAL PRIMARY KEY,
@@ -156,8 +147,6 @@ def init_db():
     
     conn.commit()
     conn.close()
-
-# (Ya no llamamos a init_db() al iniciar la app)
 
 # --- Decorador de Seguridad ---
 def login_required(f):
@@ -193,7 +182,7 @@ def logout():
 @login_required 
 def dashboard():
     conn = get_db_connection()
-    with conn.cursor(cursor_factory=RealDictCursor) as cursor: # Usar RealDictCursor
+    with conn.cursor(cursor_factory=RealDictCursor) as cursor: 
         
         # 1. Cargar Clientes
         cursor.execute('SELECT * FROM clientes ORDER BY nombre')
@@ -448,7 +437,8 @@ def get_poliza_details(poliza_id):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
         cursor.execute("""
             SELECT p.*, c.nombre, c.apellido, c.dni,
-                   to_char(p.fecha_inicio, 'DD/MM/YYYY') AS fecha_inicio_formateada 
+                   to_char(p.fecha_inicio, 'DD/MM/YYYY') AS fecha_inicio_formateada,
+                   p.fecha_inicio AS fecha_inicio_original
             FROM polizas p
             LEFT JOIN clientes c ON p.cliente_id = c.id
             WHERE p.id = %s
@@ -456,7 +446,7 @@ def get_poliza_details(poliza_id):
         poliza = cursor.fetchone()
     conn.close()
     if poliza is None: abort(404)
-    
+        
     if not poliza['fecha_inicio_formateada'] and poliza['fecha_inicio']:
         poliza['fecha_inicio_formateada'] = poliza['fecha_inicio'].strftime('%d/%m/%Y')
         
@@ -598,7 +588,8 @@ def get_mutua_details(poliza_id):
         if original_fecha_inicio:
             try:
                 fecha_inicio_dt = original_fecha_inicio
-                details['fecha_inicio'] = fecha_inicio_dt.strftime('%d/%m/%Y')
+                details['fecha_inicio_formateada'] = fecha_inicio_dt.strftime('%d/%m/%Y') # Formatear para mostrar
+                details['fecha_inicio_original'] = original_fecha_inicio.strftime('%Y-%m-%d') # Para el <input type="date">
                 
                 if details['tipo_pago'] == 'Pactada':
                     cursor.execute("""
@@ -635,7 +626,6 @@ def get_mutua_details(poliza_id):
 
             except Exception as e:
                 print(f"Error al formatear la fecha de la mutua: {e}")
-                details['fecha_inicio'] = original_fecha_inicio.strftime('%Y-%m-%d')
                 
     conn.close()
     return jsonify(details)
@@ -854,16 +844,4 @@ def delete_tarea(tarea_id):
 
 if __name__ == '__main__':
     # Esto es solo para pruebas locales
-    # Para crear la base de datos localmente, ejecuta:
-    # 1. Abre la terminal de python: python
-    # 2. from app import init_db
-    # 3. init_db()
-    # 4. exit()
-    # 5. python app.py
-    
-    # Asegurarse de que la DB local exista
-    if not os.path.exists('polizas.db'):
-        print("Creando base de datos SQLite local...")
-        init_db()
-        
     app.run(debug=True, host='0.0.0.0')
